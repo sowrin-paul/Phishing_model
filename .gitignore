@@ -68,6 +68,7 @@ datasets/
 *.csv
 *.json
 *.txt
+!requirements.txt
 *.parquet
 *.arrow
 
