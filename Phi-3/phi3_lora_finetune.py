@@ -1,100 +1,155 @@
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments
+from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, BitsAndBytesConfig
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from huggingface_hub import login, HfApi
 import os
 import getpass
+from huggingface_hub import login
+import time
 
-# Better token handling with validation and secure input
-hf_token = os.getenv("HF_TOKEN")
+# print("Starting Phi-3 LoRA Fine-tuning...")
+# print("")
+
+# Authenticate with Hugging Face
+print("Authenticating with Hugging Face")
+hf_token = getpass.getpass("Enter your HF Token: ")
 if not hf_token:
-    print("HF_TOKEN environment variable not found")
-    print("Please enter your Hugging Face token (input will be hidden):")
-    hf_token = getpass.getpass("HF Token: ")
-    if not hf_token.strip():
-        raise ValueError("No token provided")
+    raise ValueError("Hugging Face token is required to access Phi-3 model")
 
-print("Validating token...")
-try:
-    # Test token validity
-    api = HfApi()
-    user_info = api.whoami(token=hf_token)
-    print(f"Token is valid! Logged in as: {user_info['name']}")
-    login(token=hf_token, add_to_git_credential=True)
-except Exception as e:
-    print(f"Token validation failed: {e}")
-    print("Your token appears to be invalid or expired.")
-    print("Please:")
-    print("1. Check your token at https://huggingface.co/settings/tokens")
-    print("2. Generate a new token if needed")
-    print("3. Run the script again with the correct token")
-    raise ValueError("Invalid HF_TOKEN - please check your token")
+print("   Logging in to Hugging Face...")
+login(token=hf_token)
+print("   Successfully authenticated!")
 
-# base model/tokenizer
-model_name = "microsoft/phi-3-mini-4k-instruct"
+print("\nSetting up memory optimizations")
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+torch.cuda.empty_cache()
+print("   Memory optimized!")
 
-print("Loading tokenizer...")
-tokenizer = AutoTokenizer.from_pretrained(
-    model_name,
-    trust_remote_code=True,
-    token=hf_token
+# Configure 4-bit quantization for memory efficiency
+print("\nConfiguring 4-bit quantization")
+quantization_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True,
 )
-# Add padding token if not present
+print("   Quantization configured")
+
+# base model/tokenizer with quantization
+model_name = "microsoft/Phi-3-mini-4K-instruct"
+print(f"\nLoading tokenizer and model ({model_name})")
+# print("   Loading tokenizer...")
+
+start_time = time.time()
+tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
+print(f"   Tokenizer loaded ({time.time() - start_time:.1f}s)")
 
-print("Loading base model...")
+# print("   Loading model with 4-bit quantization...")
+# print("  downloading model...")
+start_time = time.time()
+
 base_model = AutoModelForCausalLM.from_pretrained(
     model_name,
-    dtype=torch.float16,
+    quantization_config=quantization_config,
     device_map="auto",
     trust_remote_code=True,
-    token=hf_token,
-    attn_implementation="eager"
+    torch_dtype=torch.float16,
+    low_cpu_mem_usage=True,
+    attn_implementation="eager",
 )
+print(f"  Model loaded successfully! ({time.time() - start_time:.1f}s)")
 
-# LoRA
-print("Preparing model for LoRA...")
+# Prepare for LoRA
+print("\nPreparing LoRA configuration")
 base_model = prepare_model_for_kbit_training(base_model)
 lora_config = LoraConfig(
-    r=8, lora_alpha=32, target_modules=["q_proj", "v_proj"], lora_dropout=0.1, bias="none", task_type="CAUSAL_LM",
+    r=16,
+    lora_alpha=32,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    lora_dropout=0.1,
+    bias="none",
+    task_type="CAUSAL_LM"
 )
 model = get_peft_model(base_model, lora_config)
+model.gradient_checkpointing_enable()
+print("   LoRA configuration applied")
 
-# load and preprocess dataset
-print("Loading dataset...")
+# Load and preprocess dataset
+print("\nLoading and preprocessing dataset")
 dataset = load_dataset("csv", data_files={"train": "phi3_lora_train.csv"})
-def preprocess(batch):
-    text = f"{batch['instruction']}\n{batch['input']}\nAnswer:"
-    labels = batch["output"]
-    inputs = tokenizer(text, truncation=True, max_length=128, padding="max_length")
-    label_ids = tokenizer(labels, truncation=True, max_length=128, padding="max_length")["input_ids"]
-    inputs["labels"] = label_ids
-    return inputs
+def preprocess(examples):
+    texts = []
+    labels = []
 
-print("Tokenizing dataset...")
-tokenized_dataset = dataset["train"].map(preprocess, batched=False)
+    for i in range(len(examples['instruction'])):
+        text = f"<|user|>\n{examples['instruction'][i]}\nURL: {examples['input'][i]}<|end|>\n<|assistant|>\n"
+        label = f"{examples['output'][i]}<|end|>"
 
-# Training Arguments
-train_args = TrainingArguments(
+        # Tokenize input and label
+        full_text = text + label
+        tokenized_full = tokenizer(full_text, truncation=True, max_length=512, padding=False)
+        tokenized_input = tokenizer(text, truncation=True, max_length=384, padding=False)
+
+        # ignore input tokens, only train on output
+        labels_ids = [-100] * len(tokenized_input["input_ids"]) + tokenized_full["input_ids"][len(tokenized_input["input_ids"]):]
+
+        # Pad to max length
+        if len(tokenized_full["input_ids"]) < 512:
+            pad_length = 512 - len(tokenized_full["input_ids"])
+            tokenized_full["input_ids"].extend([tokenizer.pad_token_id] * pad_length)
+            tokenized_full["attention_mask"].extend([0] * pad_length)
+            labels_ids.extend([-100] * pad_length)
+
+        texts.append(tokenized_full)
+        labels.append(labels_ids)
+
+    return {
+        "input_ids": [t["input_ids"] for t in texts],
+        "attention_mask": [t["attention_mask"] for t in texts],
+        "labels": labels
+    }
+
+# print("   Tokenizing and processing dataset...")
+start_time = time.time()
+tokenized_ds = dataset["train"].map(preprocess, batched=True, batch_size=100, remove_columns=dataset["train"].column_names)
+print(f"   Dataset processed ({time.time() - start_time:.1f}s)")
+
+# Training arguments with memory optimizations
+print("\nConfiguring training arguments")
+training_args = TrainingArguments(
+    output_dir="./phi3_lora_finetuned",
     per_device_train_batch_size=2,
-    gradient_accumulation_steps=4,
+    gradient_accumulation_steps=16,
     num_train_epochs=2,
     learning_rate=2e-4,
     fp16=True,
-    output_dir="./phi3_lora_finetune",
     logging_steps=10,
-    save_steps=100,
-    eval_strategy="no",
-    warmup_steps=10,
+    save_steps=500,
+    save_strategy="steps",
+    warmup_steps=100,
+    max_grad_norm=1.0,
+    dataloader_pin_memory=False,
+    remove_unused_columns=False,
+    group_by_length=True,
+    ddp_find_unused_parameters=False,
+)
+# print("   Training arguments configured")
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_ds,
+    tokenizer=tokenizer
 )
 
-print("Starting training...")
-trainer = Trainer(model=model, args=train_args, train_dataset=tokenized_dataset, tokenizer=tokenizer)
+# Start training
+print("\nStarting model training")
 trainer.train()
 
-print("Saving model...")
+# Save adapters
+print("\nSaving the trained model")
 model.save_pretrained("./phi3_lora_finetuned")
 tokenizer.save_pretrained("./phi3_lora_finetuned")
-print("Training completed successfully!")
+print("   Model saved successfully!")
