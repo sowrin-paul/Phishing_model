@@ -94,35 +94,55 @@ class PhishingDataset(Dataset):
             'label': torch.tensor(label, dtype=torch.float)
         }
 
-
-def load_phishing_data(dataset_path=None):
+def load_phishing_data(dataset_path=None, hf_dataset_id="ealvaradob/phishing-dataset", split_name="train"):
+    import pandas as pd
+    import os
 
     if dataset_path is None:
-        print("Downloading dataset from Kaggle...")
-        dataset_path = kagglehub.dataset_download("shashwatwork/web-page-phishing-detection-dataset")
-        print(f"Dataset downloaded to: {dataset_path}")
+        try:
+            from huggingface_hub import hf_hub_download
+            import json
+        except ImportError:
+            raise ImportError("Please install the Hugging Face Hub library: `pip install huggingface_hub`")
 
-    csv_files = [f for f in os.listdir(dataset_path) if f.endswith('.csv')]
+        print(f"Loading dataset from Hugging Face: {hf_dataset_id}")
 
-    if not csv_files:
-        raise FileNotFoundError(f"No CSV files found in {dataset_path}")
+        # Download the urls.json file (contains URLs without spam messages)
+        print("   Downloading urls.json (URL-only data, no spam messages)...")
+        file_path = hf_hub_download(
+            repo_id=hf_dataset_id,
+            filename='urls.json',
+            repo_type='dataset'
+        )
 
-    csv_file = csv_files[0]
-    full_path = os.path.join(dataset_path, csv_file)
+        # Load JSON data
+        with open(file_path, 'r') as f:
+            data = json.load(f)
 
-    print(f"Loading data from: {full_path}")
+        # Convert to DataFrame
+        df = pd.DataFrame(data)
+        print(f"   Successfully loaded {len(df):,} URLs from ealvaradob/phishing-dataset")
 
-    df = pd.read_csv(full_path)
+    else:
+        # Local CSV path (existing behavior)
+        csv_files = [f for f in os.listdir(dataset_path) if f.endswith('.csv')]
+        if not csv_files:
+            raise FileNotFoundError(f"No CSV files found in {dataset_path}")
+
+        csv_file = csv_files[0]
+        full_path = os.path.join(dataset_path, csv_file)
+        print(f"Loading data from: {full_path}")
+        df = pd.read_csv(full_path)
 
     print(f"Dataset shape: {df.shape}")
     print(f"Columns: {list(df.columns)}")
-    print(f"First few rows:")
-    print(df.head())
 
+    # Detect URL and label columns
     url_column = None
     label_column = None
 
-    url_candidates = ['url', 'URL', 'website', 'domain', 'link']
+    # For ealvaradob dataset, the columns are 'text' and 'label'
+    url_candidates = ['text', 'url', 'URL', 'website', 'domain', 'link']
     for col in df.columns:
         if col.lower() in [c.lower() for c in url_candidates]:
             url_column = col
@@ -139,8 +159,12 @@ def load_phishing_data(dataset_path=None):
         print(f"Auto-detected URL column: {url_column}")
 
     if label_column is None:
-        label_column = df.columns[1]
+        label_column = df.columns[1] if len(df.columns) > 1 else df.columns[0]
         print(f"Auto-detected label column: {label_column}")
+
+    # Keep ONLY URL and label columns - exclude any message/text content
+    df = df[[url_column, label_column]]
+    print(f"Using only URL and label columns (no spam message content)")
 
     df = df.dropna(subset=[url_column, label_column])
     df[url_column] = df[url_column].astype(str)
@@ -148,6 +172,7 @@ def load_phishing_data(dataset_path=None):
     unique_labels = df[label_column].unique()
     print(f"Unique labels found: {unique_labels}")
 
+    # Handle different label formats
     if set(unique_labels) == {0, 1}:
         pass
     elif set(unique_labels) == {'good', 'bad'}:
@@ -157,15 +182,15 @@ def load_phishing_data(dataset_path=None):
     elif set(unique_labels) == {'benign', 'phishing'}:
         df[label_column] = df[label_column].map({'benign': 0, 'phishing': 1})
     else:
-        # Try to convert to numeric
         df[label_column] = pd.to_numeric(df[label_column], errors='coerce')
         df = df.dropna(subset=[label_column])
         df[label_column] = df[label_column].astype(int)
 
-    # Final check
     final_labels = df[label_column].unique()
     print(f"Final labels after conversion: {final_labels}")
-    print(f"Label distribution:")
+    print("Label distribution:")
     print(df[label_column].value_counts())
+    print(f"\nFirst few URLs:")
+    print(df[url_column].head())
 
     return df[url_column].tolist(), df[label_column].tolist()

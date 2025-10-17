@@ -1,8 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sympy import sequence
-from torch.onnx.ops import attention
+from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score
 import numpy as np
@@ -17,56 +16,97 @@ class PhishingTrainer:
         self.device = device
 
         self.criterion = nn.BCELoss()
-        self.optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', patience=3, factor=0.5
+        # Use AdamW with higher learning rate for faster convergence
+        self.optimizer = optim.AdamW(model.parameters(), lr=0.003, weight_decay=1e-4)
+        # More aggressive learning rate scheduling
+        self.scheduler = optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=0.003,
+            epochs=20,
+            steps_per_epoch=len(train_loader),
+            pct_start=0.3,
+            anneal_strategy='cos'
         )
+
+        # Mixed precision training for faster computation
+        self.scaler = GradScaler() if device == 'cuda' else None
+        self.use_amp = device == 'cuda'
 
         self.train_loss = []
         self.valid_loss = []
         self.valid_accuracy = []
 
+        # Gradient accumulation for effective larger batch size
+        self.accumulation_steps = 2
+
     def train_epoch(self):
         self.model.train()
         total_loss = 0
+        self.optimizer.zero_grad()
 
-        for batch in tqdm(self.train_loader, desc="Training"):
-            sequences = batch['sequence'].to(self.device)
-            masks = batch['mask'].to(self.device)
-            labels = batch['label'].to(self.device)
+        for idx, batch in enumerate(tqdm(self.train_loader, desc="Training")):
+            sequences = batch['sequence'].to(self.device, non_blocking=True)
+            masks = batch['mask'].to(self.device, non_blocking=True)
+            labels = batch['label'].to(self.device, non_blocking=True)
 
-            self.optimizer.zero_grad()
+            # Mixed precision training
+            if self.use_amp:
+                with autocast():
+                    outputs, _ = self.model(sequences, masks)
+                    loss = self.criterion(outputs, labels)
+                    loss = loss / self.accumulation_steps
 
-            outputs, attention_weights = self.model(sequences, masks)
-            loss = self.criterion(outputs, labels)
+                self.scaler.scale(loss).backward()
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
+                if (idx + 1) % self.accumulation_steps == 0:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.optimizer.zero_grad()
+                    self.scheduler.step()
+            else:
+                outputs, _ = self.model(sequences, masks)
+                loss = self.criterion(outputs, labels)
+                loss = loss / self.accumulation_steps
 
-            total_loss += loss.item()
+                loss.backward()
+
+                if (idx + 1) % self.accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    self.scheduler.step()
+
+            total_loss += loss.item() * self.accumulation_steps
+
         return total_loss / len(self.train_loader)
 
+    @torch.no_grad()
     def validate(self):
         self.model.eval()
         total_loss = 0
         all_prediction = []
         all_labels = []
 
-        with torch.no_grad():
-            for batch in tqdm(self.valid_loader, desc="Validation"):
-                sequences = batch['sequence'].to(self.device)
-                masks = batch['mask'].to(self.device)
-                labels = batch['label'].to(self.device)
+        for batch in tqdm(self.valid_loader, desc="Validation"):
+            sequences = batch['sequence'].to(self.device, non_blocking=True)
+            masks = batch['mask'].to(self.device, non_blocking=True)
+            labels = batch['label'].to(self.device, non_blocking=True)
 
-                outputs, attention_weight = self.model(sequences, masks)
+            if self.use_amp:
+                with autocast():
+                    outputs, _ = self.model(sequences, masks)
+                    loss = self.criterion(outputs, labels)
+            else:
+                outputs, _ = self.model(sequences, masks)
                 loss = self.criterion(outputs, labels)
 
-                total_loss += loss.item()
+            total_loss += loss.item()
 
-                prediction = (outputs > 0.5).float()
-                all_prediction.extend(prediction.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
+            prediction = (outputs > 0.5).float()
+            all_prediction.extend(prediction.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
 
         avg_loss = total_loss / len(self.valid_loader)
         accuracy = accuracy_score(all_labels, all_prediction)
@@ -91,9 +131,6 @@ class PhishingTrainer:
 
             val_loss, accuracy, precision, recall, f1, auc = self.validate()
 
-            # lr scheduling
-            self.scheduler.step(val_loss)
-
             # Save metrics
             self.train_loss.append(train_loss)
             self.valid_loss.append(val_loss)
@@ -106,6 +143,7 @@ class PhishingTrainer:
             print(f"Recall: {recall:.4f}")
             print(f"F1: {f1:.4f}")
             print(f"AUC: {auc:.4f}")
+            print(f"LR: {self.optimizer.param_groups[0]['lr']:.6f}")
 
             # Save best model
             if val_loss < best_val_loss:
@@ -130,7 +168,7 @@ class PhishingTrainer:
         ax1.set_ylabel('Loss')
         ax1.legend()
 
-        #
+        # Accuracy plot
         ax2.plot(self.valid_accuracy, label='Val Accuracy')
         ax2.set_title('Validation Accuracy')
         ax2.set_xlabel('Epoch')
@@ -138,4 +176,5 @@ class PhishingTrainer:
         ax2.legend()
 
         plt.tight_layout()
+        plt.savefig('training_history.png', dpi=150, bbox_inches='tight')
         plt.show()

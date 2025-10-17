@@ -7,14 +7,14 @@ import getpass
 from huggingface_hub import login
 import time
 
-# print("Starting Phi-3 LoRA Fine-tuning...")
+# print("Starting Phi3 LoRA Fine-tuning...")
 # print("")
 
 # Authenticate with Hugging Face
 print("Authenticating with Hugging Face")
 hf_token = getpass.getpass("Enter your HF Token: ")
 if not hf_token:
-    raise ValueError("Hugging Face token is required to access Phi-3 model")
+    raise ValueError("Hugging Face token is required to access Phi3 model")
 
 print("   Logging in to Hugging Face...")
 login(token=hf_token)
@@ -36,7 +36,7 @@ quantization_config = BitsAndBytesConfig(
 print("   Quantization configured")
 
 # base model/tokenizer with quantization
-model_name = "microsoft/Phi-3-mini-4K-instruct"
+model_name = "microsoft/Phi3-mini-4K-instruct"
 print(f"\nLoading tokenizer and model ({model_name})")
 # print("   Loading tokenizer...")
 

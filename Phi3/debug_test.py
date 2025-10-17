@@ -3,7 +3,7 @@ import os
 import getpass
 from huggingface_hub import login
 
-print("=== Phi-3 Fine-tuning Debug Test ===")
+print("=== Phi3 Fine-tuning Debug Test ===")
 
 # Test 1: Authentication
 print("Step 1: Testing Hugging Face authentication...")
@@ -31,7 +31,7 @@ if torch.cuda.is_available():
 print("Step 3: Testing tokenizer loading...")
 try:
     from transformers import AutoTokenizer
-    model_name = "microsoft/Phi-3-mini-4K-instruct"
+    model_name = "microsoft/Phi3-mini-4K-instruct"
     print(f"Loading tokenizer for {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     print("✓ Tokenizer loaded successfully!")
